@@ -24,6 +24,27 @@ OpenCode handles model selection and plugin fallbacks — Hermes drives the ACP 
 - **OpenCode auth configured**: `opencode auth login` or set provider env vars (OPENROUTER_API_KEY, etc.)
 - **Verify**: `opencode run 'hello'` should work standalone
 
+## OpenCode V1 and V2
+
+Works with both generations (verified live on opencode 1.18.x and 2.0.20):
+
+- The ACP wire protocol is unchanged between generations — same `opencode acp`
+  command, JSON-RPC 2.0 over stdio, ACP v1.
+- **Model ids differ.** V1 advertised bare model names (`deepseek-v4-flash`);
+  V2 advertises full `provider/model` ids (`opencode/deepseek-v4-flash`,
+  `openai/gpt-4o-mini`) and validates `session/set_config_option` against that
+  catalog. The client resolves requests against the session's advertised
+  catalog (exact → case-insensitive → V1 bare-name forms, preferring the
+  OpenCode-hosted `opencode/…` tier on ambiguity), so old V1-style entries keep
+  working and only catalog-exact ids are ever sent.
+- **V2 allows one active prompt per session** — the client serializes the
+  switch + prompt region per shared session.
+- **A model being in the catalog does not mean it can run.** V2 advertises
+  every known model, including ones whose provider you are not signed into;
+  those are refused at prompt time. The client surfaces that as a clear
+  `Model unavailable` error with the `opencode auth login` fix instead of
+  OpenCode's bare internal error.
+
 ## Install
 
 ```bash
@@ -127,6 +148,18 @@ Hermes                         OpenCode
 **No streaming text**
 - The model may not support streaming via ACP
 - Try a different model in OpenCode's config
+
+**"requested model '…' is not in this session's model catalog"**
+- OpenCode 2.x validates model ids against the catalog it advertises for the
+  session (full `provider/model` ids). The old id may be retired upstream —
+  `opencode/mimo-v2.5-free`, for example, is now `opencode/mimo-v2.6-flash-free`.
+- Pick a live id: `hermes model` (probes the real catalog) or the exact id
+  from a fresh session.
+
+**"model '…' is listed in the session's catalog but the server refused to run it"**
+- V2 advertises models whose provider you are not signed into; they only fail
+  at prompt time. Run `opencode auth login`, or pick a model from a provider
+  you are signed into (e.g. the `opencode/…` tier).
 
 ## License
 

@@ -14,7 +14,7 @@ Use [OpenCode](https://opencode.ai) as a coding agent backend for [Hermes Agent]
 Connects Hermes to OpenCode via JSON-RPC over stdio. OpenCode handles model selection, tool use, and plugin fallbacks — Hermes drives the ACP wire.
 
 > **✅ Stable / daily driver** — In active daily use on Hermes Agent (macOS,
-> Hermes 0.21.x, opencode 1.18.x). If something breaks, please open an issue.
+> Hermes 0.21.x, opencode 1.18.x and 2.x). If something breaks, please open an issue.
 > Contributions welcome.
 
 > **👀 Upstream watch** — Hermes Agent core is planning its own generalized
@@ -24,6 +24,21 @@ Connects Hermes to OpenCode via JSON-RPC over stdio. OpenCode handles model sele
 > [UPSTREAM.md](./UPSTREAM.md) for the migration checklist.
 
 ## News
+
+**2026-10-02 — v1.3.0 adds OpenCode 2.x (V2) support.** Verified live on
+opencode 2.0.20 + Hermes 0.21.5. The ACP wire protocol is unchanged between
+OpenCode generations, but V2 advertises full `provider/model` model ids
+(V1 advertised bare names) and validates `session/set_config_option`
+against that catalog — so V1-style model entries used to fall back to the
+session default **silently**. The client now resolves every model request
+against the session's advertised catalog (both id generations, preferring
+the `opencode/…` hosted tier on ambiguity), sends only catalog-exact ids,
+raises a clear error for retired/unresolvable ids instead of silently
+running a different model, rewrites V2's bare `Model unavailable` internal
+error into actionable guidance (the catalog includes models whose provider
+you may not be signed into), and serializes prompts per session (V2 allows
+one active prompt per session). Old V1-style config entries keep working
+through the resolver.
 
 **2026-09-22 — OpenCode's free tier now only works from inside OpenCode.**
 Direct HTTP calls to the Zen free tier are rejected server-side (verified
@@ -179,24 +194,35 @@ export OPENCODE_ACP_BASE_URL="acp://opencode"
 ```yaml
 fallback_providers:
   - provider: opencode-acp
-    model: opencode/mimo-v2.5-free
+    model: opencode/mimo-v2.6-flash-free
     base_url: acp://opencode
   - provider: opencode-acp
     model: opencode/kimi-k2.6
     base_url: acp://opencode
 ```
 
+> **Model ids must exist in the session's catalog.** OpenCode 2.x (V2)
+> advertises full `provider/model` ids and validates
+> `session/set_config_option` against them — ids retired upstream
+> (`opencode/mimo-v2.5-free` is now `opencode/mimo-v2.6-flash-free`) now fail
+> loudly with the closest matches instead of silently running the session
+> default. V1-style bare names (`deepseek-v4-flash`) still work: the client
+> resolves them against the live catalog before sending.
+
 > **Model switching keeps the session (1:1 continuation).**  The client cache
 > is keyed by `(command, args, cwd)` — NOT by model.  When Hermes falls back
 > to a different model (or you `/model`-switch), the *same* OpenCode process
 > and session stay alive and the new model is applied in place via
-> `session/set_config_option` (verified live on opencode 1.18.20: the session
-> recalls earlier context after the switch).  No fresh process, no history loss.
+> `session/set_config_option` (verified live on opencode 1.18.20 and 2.0.20:
+> the session recalls earlier context after the switch).  No fresh process,
+> no history loss.
 
 > **Model picking is ACP-native.**  `/model` and `hermes model` probe the
 > `opencode acp` server itself for its advertised model catalog (the same list
 > it validates `session/set_config_option` against) instead of a static list.
-> `opencode models` CLI remains the fallback.
+> `opencode models` CLI remains the fallback. Note the catalog lists every
+> known model — including ones whose provider you are not signed into; those
+> fail at prompt time with a clear `Model unavailable` error.
 
 ## Architecture
 
