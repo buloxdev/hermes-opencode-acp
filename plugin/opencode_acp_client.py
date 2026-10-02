@@ -62,6 +62,96 @@ def _normalise_model(value: str | None) -> str:
     return v
 
 
+def _resolve_catalog_model(
+    requested: str | None,
+    catalog: list[str],
+) -> tuple[str | None, list[str]]:
+    """Resolve a requested model id against the session's advertised catalog.
+
+    OpenCode V1 (1.x) advertised bare model names ("deepseek-v4-flash");
+    V2 (2.x) advertises full ``provider/model`` ids ("openai/gpt-4o-mini")
+    and validates ``session/set_config_option`` against that list.  Accept
+    both generations by *matching* the request against the catalog — never
+    by sending an id we cannot verify — and always return the catalog-exact
+    spelling to send back to the server.
+
+    Returns ``(resolved, suggestions)``:
+
+    * resolved — the catalog-exact id to send; the request itself when the
+      catalog is empty (unknown/old server, nothing to verify against); or
+      None when the request matches nothing.
+    * suggestions — catalog entries sharing the model part, for error text.
+    """
+    want = (requested or "").strip()
+    if not want:
+        return None, []
+    if not catalog:
+        # Server did not advertise a catalog — send verbatim, nothing to
+        # verify against.  (Keeps unknown ACP servers working as before.)
+        return want, []
+    if want in catalog:
+        return want, []
+    by_lower = {c.lower(): c for c in catalog}
+    if want.lower() in by_lower:
+        return by_lower[want.lower()], []
+    # V1 form: catalog holds bare names, request carries a provider prefix
+    # ("opencode/deepseek-v4-flash" → "deepseek-v4-flash").
+    bare = want.rsplit("/", 1)[-1].strip()
+    if bare != want:
+        if bare in catalog:
+            return bare, []
+        if bare.lower() in by_lower:
+            return by_lower[bare.lower()], []
+    # Bare V1-style request against a V2 catalog: match the model part of
+    # "provider/model" entries ("gpt-4o-mini" → "openai/gpt-4o-mini").
+    # On ambiguity prefer the OpenCode-hosted tier ("opencode/<name>").
+    suggestions = [c for c in catalog if c.rsplit("/", 1)[-1].lower() == bare.lower()]
+    if suggestions:
+        hosted = [c for c in suggestions if c.startswith("opencode/")]
+        if len(hosted) == 1:
+            return hosted[0], suggestions
+        if len(suggestions) == 1:
+            return suggestions[0], suggestions
+    return None, suggestions
+
+
+def _unresolved_model_error(requested: str, suggestions: list[str]) -> RuntimeError:
+    """Error for a requested model that matches no advertised catalog entry."""
+    hint = ""
+    if suggestions:
+        hint = f"Closest matches: {', '.join(suggestions[:5])}. "
+    return RuntimeError(
+        f"OpenCode ACP: requested model '{requested}' is not in this session's "
+        f"model catalog. {hint}"
+        "OpenCode 2.x advertises full provider/model ids (e.g. "
+        "'opencode/deepseek-v4-flash', 'openai/gpt-4o-mini') and validates "
+        "session/set_config_option against them. Pick a live id with "
+        "`hermes model` or use a full provider/model id."
+    )
+
+
+def _augment_prompt_error(
+    exc: BaseException,
+    session_model: str | None,
+) -> BaseException:
+    """Clarify V2 'Model unavailable' prompt failures for the Hermes side.
+
+    V2 advertises every cataloged model — including ones whose provider the
+    user is not signed into — and only refuses them at prompt time with a
+    bare "Internal error: Model unavailable: <id>".  Rewrite that into the
+    likely cause and the fix; pass everything else through unchanged.
+    """
+    if session_model and "model unavailable" in str(exc).lower():
+        return RuntimeError(
+            f"OpenCode ACP: model '{session_model}' is listed in the session's "
+            f"catalog but the server refused to run it: {exc}. The provider "
+            "behind that model is most likely not signed in — run "
+            "`opencode auth login` or pick a model from a provider you are "
+            "signed into (e.g. the `opencode/…` tier), then retry."
+        )
+    return exc
+
+
 def _resolve_command() -> str:
     return (
         os.getenv("HERMES_OPENCODE_ACP_COMMAND", "").strip()
@@ -100,15 +190,13 @@ def _build_subprocess_env(model: str | None = None) -> dict[str, str]:
     env["HOME"] = home
     from hermes_constants import apply_subprocess_home_env
     apply_subprocess_home_env(env)
-    # Pass model to OpenCode via env var. OpenCode resolves its model
-    # from config at startup; OPENCODE_MODEL overrides the config default.
-    # Strip "opencode/" prefix if present (e.g. "opencode/deepseek-v4-flash"
-    # → "deepseek-v4-flash") since OpenCode's env var expects bare model names.
+    # Pass the model through to OpenCode via env var (best-effort hint;
+    # the authoritative lever is session/set_config_option, which the
+    # resolver feeds catalog-exact ids).  V1 expected bare model names,
+    # V2 expects the same full "provider/model" ids its catalog advertises
+    # — pass the id through unchanged so both generations keep working.
     if model:
-        bare = model
-        if bare.lower().startswith("opencode/"):
-            bare = bare[len("opencode/"):]
-        env["OPENCODE_MODEL"] = bare
+        env["OPENCODE_MODEL"] = model
     return env
 
 
@@ -638,6 +726,11 @@ class OpenCodeACPClient:
         # ── Persistent session state ──
         self._proc: subprocess.Popen[str] | None = None
         self._proc_lock = threading.Lock()
+        # OpenCode 2.x allows ONE active prompt per session; this client is
+        # shared across threads via the module-level cache, so serialize the
+        # model-switch + prompt region to keep concurrent completions from
+        # interleaving on the same session.
+        self._prompt_lock = threading.Lock()
         self._inbox: queue.Queue[dict[str, Any]] = queue.Queue()
         self._stderr_tail: deque[str] = deque(maxlen=40)
         self._stdout_thread: threading.Thread | None = None
@@ -795,37 +888,51 @@ class OpenCodeACPClient:
         # running, switch it in place via session/set_config_option.  This is
         # what keeps a 1:1 Hermes-session → OpenCode-session mapping across
         # fallback-model changes instead of spawning a fresh process.
+        # V2 note: the value MUST be a catalog-exact "provider/model" id —
+        # bare V1-style names are rejected.  Resolve first; an unresolvable
+        # request raises (Hermes then walks its fallback chain) instead of
+        # silently running the previous model and burning tokens on it.
         requested = (model or self._acp_model or "").strip() or None
-        if (
-            requested
-            and self._initialized
-            and self._session_id
-            and _normalise_model(self._session_model) != _normalise_model(requested)
-        ):
-            try:
-                self._send_request(
-                    "session/set_config_option",
-                    {
-                        "sessionId": self._session_id,
-                        "configId": "model",
-                        "value": requested,
-                    },
-                    timeout_seconds=max(_effective_timeout, 60.0),
+        # V2 allows ONE active prompt per session — serialize the switch +
+        # prompt region so concurrent completions on this shared client
+        # cannot interleave on the same session.
+        with self._prompt_lock:
+            if (
+                requested
+                and self._initialized
+                and self._session_id
+                and _normalise_model(self._session_model) != _normalise_model(requested)
+            ):
+                resolved, suggestions = _resolve_catalog_model(
+                    requested, self._model_catalog
                 )
-                self._session_model = requested
-            except Exception:
-                # Switching failed (model not in catalog / server too old) —
-                # continue with the session's current model.
-                pass
-        elif requested and not self._initialized:
-            # Cold start: remember the requested model; _ensure_process applies
-            # it right after session/new.
-            self._acp_model = requested
+                if resolved is None:
+                    raise _unresolved_model_error(requested, suggestions)
+                try:
+                    self._send_request(
+                        "session/set_config_option",
+                        {
+                            "sessionId": self._session_id,
+                            "configId": "model",
+                            "value": resolved,
+                        },
+                        timeout_seconds=max(_effective_timeout, 60.0),
+                    )
+                    self._session_model = resolved
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"OpenCode ACP: switching session model to "
+                        f"'{resolved}' failed: {exc}"
+                    ) from exc
+            elif requested and not self._initialized:
+                # Cold start: remember the requested model; _ensure_process applies
+                # it right after session/new.
+                self._acp_model = requested
 
-        response_text, reasoning_text, acp_usage = self._run_prompt(
-            prompt_text,
-            timeout_seconds=_effective_timeout,
-        )
+            response_text, reasoning_text, acp_usage = self._run_prompt(
+                prompt_text,
+                timeout_seconds=_effective_timeout,
+            )
 
         tool_calls, cleaned_text = _extract_tool_calls_from_text(response_text)
 
@@ -888,6 +995,13 @@ class OpenCodeACPClient:
                 self._proc = None
                 self._initialized = False
                 self._session_id = None
+
+            # Alive but never finished initializing (e.g. a prompt timed out
+            # mid-flight and _run_prompt marked us stale) — terminate it so we
+            # respawn cleanly instead of leaking the old process and its
+            # reader threads alongside a fresh spawn.
+            if self._proc is not None and self._proc.poll() is None and not self._initialized:
+                self._teardown_uninitialized_process()
 
             if self._initialized:
                 return
@@ -994,25 +1108,60 @@ class OpenCodeACPClient:
 
             # ── Apply the configured model if it differs from the default ──
             # session/set_config_option is the ONLY reliable lever (verified
-            # live on opencode 1.18.20).  Fails soft: keep the server default.
+            # live on opencode 1.18.20 and 2.0.20).  V2 validates the value
+            # against the advertised catalog, so resolve to a catalog-exact
+            # id first; a mismatch is a misconfiguration to surface, not to
+            # paper over by silently running a different model.
             if self._acp_model and _normalise_model(self._session_model) != _normalise_model(self._acp_model):
+                resolved, suggestions = _resolve_catalog_model(
+                    self._acp_model, self._model_catalog
+                )
+                if resolved is None:
+                    # Tear down the half-initialized process so a retry
+                    # spawns cleanly instead of resurrecting it.
+                    self._teardown_uninitialized_process()
+                    raise _unresolved_model_error(self._acp_model, suggestions)
                 try:
                     self._send_request(
                         "session/set_config_option",
                         {
                             "sessionId": self._session_id,
                             "configId": "model",
-                            "value": self._acp_model,
+                            "value": resolved,
                         },
                         timeout_seconds=timeout_seconds,
                     )
-                    self._session_model = self._acp_model
-                except Exception:
-                    # Model not in this session's catalog / server too old —
-                    # opencode runs its config default; not fatal.
-                    pass
+                    self._session_model = resolved
+                except Exception as exc:
+                    self._teardown_uninitialized_process()
+                    raise RuntimeError(
+                        f"OpenCode ACP: applying configured model "
+                        f"'{resolved}' failed: {exc}"
+                    ) from exc
 
             self._initialized = True
+
+    def _teardown_uninitialized_process(self) -> None:
+        """Terminate a spawned-but-never-initialized ACP process.
+
+        Called on cold-start model-application failures so the next
+        _ensure_process() call respawns cleanly instead of adopting the
+        half-initialized process (or leaking it).  Caller holds _proc_lock.
+        """
+        proc = self._proc
+        self._proc = None
+        self._session_id = None
+        self._initialized = False
+        if proc is None:
+            return
+        try:
+            proc.terminate()
+            proc.wait(timeout=2)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
 
     def _send_request(
         self,
@@ -1101,9 +1250,15 @@ class OpenCodeACPClient:
             ) or {}
             usage = _parse_acp_usage(result.get("usage"))
             return "".join(text_parts), "".join(reasoning_parts), usage
-        except Exception:
+        except Exception as exc:
             # On any error, mark stale so next call respawns.
             self._initialized = False
+            # V2: "Model unavailable" means the id is cataloged but not
+            # runnable with the user's current OpenCode credentials — make
+            # that actionable instead of surfacing the bare internal error.
+            augmented = _augment_prompt_error(exc, self._session_model)
+            if augmented is not exc:
+                raise augmented from exc
             raise
 
     def _handle_server_message(
